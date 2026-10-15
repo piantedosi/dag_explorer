@@ -2,21 +2,24 @@ import inspect
 import os
 import random
 import re
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from graphviz import Source
+from typing import Annotated, TypedDict
 
-import base64
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_huggingface import HuggingFaceEndpoint, ChatHuggingFace
-
-from typing import TypedDict, Annotated, Optional
-from langchain_core.messages import AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
+from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-
-from langchain_core.messages import SystemMessage
+from langgraph.prebuilt import ToolNode
+from langgraph.types import RetryPolicy
 
 from dag import Dag, edge_report
+
+
+##### Setup #####
+NODE_COUNT = 4
+EASY = False
 
 
 def _load_dotenv() -> None:
@@ -37,8 +40,10 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-dag = Dag.generate(random.Random(0), 2)
+dag = Dag.generate(random.Random(0), NODE_COUNT)
 
+
+##### Tools #####
 
 def _fmt(value: float | None) -> str:
     return "--" if value is None else f"{value:.2f}"
@@ -78,7 +83,10 @@ def _status() -> str:
             shown = f"{shown} {' '.join(marks)}"
         rows.append("\t".join([src_name, *cells, shown]))
     missing, wrong = dag.edge_counts()
-    rows.append(edge_report(missing, wrong))
+    if EASY:
+        rows.append(edge_report(missing, wrong))
+    elif missing == 0 and wrong == 0:
+        rows.append("CORRECT GRAPH :)")
     return "\n".join(rows)
 
 
@@ -135,12 +143,23 @@ def unfreeze_node(name: str) -> str:
     return f"unfroze {name}."
 
 
-def show_status() -> str:
-    """Show the hypothesized adjacency matrix and each node value.
+def _show_status_doc() -> str:
+    """Docstring for show_status. Hard mode hides the edge counts."""
+    feedback = (
+        "The last line reports how many true edges are missing and how many guessed edges are wrong."
+        if EASY
+        else "The last line is CORRECT GRAPH :) only when the hypothesized edges match the hidden graph."
+    )
+    example_tail = (
+        "\n            there are 4 missing edges and 0 wrong edges"
+        if EASY
+        else ""
+    )
+    return f"""Show the hypothesized adjacency matrix and each node value.
 
     Rows and columns are node names. A cell is 1 when that edge is hypothesized and 0 otherwise.
     Values use two decimal places. F marks a frozen node. C marks a node that is not frozen but whose shown value differs from the unfrozen default.
-    The last line reports how many true edges are missing and how many guessed edges are wrong.
+    {feedback}
 
     Returns:
         A tab-separated matrix. in this format:
@@ -149,18 +168,17 @@ def show_status() -> str:
             node1   0       1       0       0       1.50 F
             node2   0       0       0       0       0.48 C
             node3   0       0       0       0       10.44 C
-            node4   0       0       0       0       1.15 C
-            there are 4 missing edges and 0 wrong edges
+            node4   0       0       0       0       1.15 C{example_tail}
         ```
-        The matrix has as many rows and columns as there are nodes.
-        the rows are the source nodes and the columns are the target nodes.
-        the cells are 1 when there is an edge from the source node to the target node and 0 otherwise.
-        the values are the values of the nodes.
-        the F marks a frozen node.
-        the C marks a node that is not frozen but whose shown value differs from the unfrozen default.
-        the last line reports how many true edges are missing and how many guessed edges are wrong.
     """
+
+
+def show_status() -> str:
+    """Show the hypothesized adjacency matrix and each node value."""
     return _status()
+
+
+show_status.__doc__ = _show_status_doc()
 
 
 def finish(note: str) -> str:
@@ -178,6 +196,15 @@ def finish(note: str) -> str:
     return f"finished: {note}"
 
 
+tools = [
+    draw_edge,
+    freeze_node,
+    unfreeze_node,
+    show_status,
+    finish,
+]
+
+
 def tool_prompt() -> str:
     """Format each tool signature and docstring for the system prompt."""
     blocks = []
@@ -186,16 +213,9 @@ def tool_prompt() -> str:
         blocks.append(f"{fn.__name__}{inspect.signature(fn)}\n{doc}")
     return "\n\n".join(blocks)
 
-tools = [
-    draw_edge,
-    freeze_node,
-    unfreeze_node,
-    show_status,
-    finish,
-]
-_EMPTY_NUDGE = (
-    "Thought too long and nothing was decided. Think for less time, then call one tool."
-)
+
+##### Model #####
+
 _llm_with_tools = None
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
@@ -259,10 +279,125 @@ def get_llm_with_tools():
             temperature=0.1,
             max_new_tokens=8000,
         )
-        vision_llm = _ReasoningChat(llm=llm_endpoint)
-        _llm_with_tools = vision_llm.bind_tools(tools)
+        chat = _ReasoningChat(llm=llm_endpoint)
+        _llm_with_tools = chat.bind_tools(tools)
     return _llm_with_tools
 
+
+##### Graph #####
+
+_EMPTY_NUDGE = (
+    "Thought too long and nothing was decided. Think for less time, then call one tool."
+)
+_MAX_NUDGES = 3
+
+
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    loop_count: int
+
+
+def assistant(state: AgentState):
+    if EASY:
+        feedback = "You will be able to see the number of missing and wrong edges."
+    else:
+        feedback = (
+            "show_status ends with CORRECT GRAPH :) only when the hypothesized graph is correct."
+        )
+    sys_msg = SystemMessage(
+        content="\n".join(
+            [
+                "You will try to discover the directed edges of a hidden causal DAG.",
+                "You can create counterfactuals by freezing nodes to new values.",
+                feedback,
+                "You will have access to the following tools:",
+                "Tools:",
+                tool_prompt(),
+                "",
+                "Call show_status to read the matrix. Do not invent node names or values.",
+                "Do not stop by writing a summary. Call finish when the exploration is done.",
+            ]
+        )
+    )
+
+    message = get_llm_with_tools().invoke([sys_msg] + state["messages"])
+    if getattr(message, "tool_calls", None):
+        return {"messages": [message], "loop_count": 0}
+    count = state.get("loop_count", 0) + 1
+    if count >= _MAX_NUDGES:
+        return {
+            "messages": [message, AIMessage(content=_status())],
+            "loop_count": count,
+        }
+    return {"messages": [message], "loop_count": count}
+
+
+def nudge(state: AgentState) -> dict:
+    """Append the hint that asks for one tool call."""
+    return {"messages": [HumanMessage(content=_EMPTY_NUDGE)]}
+
+
+def _route_after_assistant(state: AgentState) -> str:
+    """Send a tool call to tools, an empty reply to nudge, and the third empty reply to the end."""
+    last = state["messages"][-1]
+    if getattr(last, "tool_calls", None):
+        return "tool_call"
+    if not isinstance(last, AIMessage):
+        raise RuntimeError(
+            f"assistant left {type(last).__name__}, expected a tool call or an assistant message"
+        )
+    if state.get("loop_count", 0) >= _MAX_NUDGES:
+        return "gave_up"
+    return "empty_reply"
+
+
+def _route_after_tools(state: AgentState) -> str:
+    for message in reversed(state["messages"]):
+        if isinstance(message, AIMessage) and message.tool_calls:
+            if any(call["name"] == "finish" for call in message.tool_calls):
+                return "finish"
+            return "continue"
+    return "continue"
+
+
+def _retry_rate_limit(exc: Exception) -> bool:
+    """Retry only a Hugging Face 429. The hub error subclasses OSError, which the default policy skips."""
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None) == 429
+
+
+def build_graph():
+    """Compile the assistant/tools loop once."""
+    builder = StateGraph(AgentState)
+    builder.add_node(
+        "assistant",
+        assistant,
+        retry_policy=RetryPolicy(
+            initial_interval=5.0,
+            backoff_factor=2.0,
+            max_interval=60.0,
+            max_attempts=6,
+            retry_on=_retry_rate_limit,
+        ),
+    )
+    builder.add_node("nudge", nudge)
+    builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
+    builder.add_edge(START, "assistant")
+    builder.add_edge("nudge", "assistant")
+    builder.add_conditional_edges(
+        "assistant",
+        _route_after_assistant,
+        {"tool_call": "tools", "empty_reply": "nudge", "gave_up": END},
+    )
+    builder.add_conditional_edges(
+        "tools",
+        _route_after_tools,
+        {"continue": "assistant", "finish": END},
+    )
+    return builder.compile()
+
+
+##### Run #####
 
 def _format_message(message) -> str:
     reasoning = ""
@@ -298,103 +433,10 @@ def _open_trace_log():
     return path.open("w", encoding="utf-8"), path
 
 
-
-class AgentState(TypedDict):
-    # The input document
-    messages: Annotated[list[AnyMessage], add_messages]
-    loop_count: int
-
-
-
-def assistant(state: AgentState):
-    sys_msg = SystemMessage(
-        content="\n".join(
-            [
-                "You will try to discover the directed edges of a hidden causal DAG.",
-                "You can create counterfactuals by freezing nodes to new values.",
-                "You will be able to see the number of missing and wrong edges.",
-                "You will have access to the following tools:",
-                "Tools:",
-                tool_prompt(),
-                "",
-                "Call show_status to read the matrix. Do not invent node names or values.",
-                "Do not stop by writing a summary. Call finish when the exploration is done.",
-            ]
-        )
-    )
-
-    message = get_llm_with_tools().invoke([sys_msg] + state["messages"])
-    return {"messages": [_nudge_if_empty(message)]}
-
-
-def _nudge_if_empty(message):
-    """Replace a blank generation so the next turn sees a shorter-thinking hint."""
-    if not isinstance(message, AIMessage) or message.tool_calls:
-        return message
-    content = message.content
-    if isinstance(content, str) and content.strip():
-        return message
-    if isinstance(content, list) and content:
-        return message
-    message.content = _EMPTY_NUDGE
-    return message
-
-
-def _route_after_assistant(state: AgentState) -> str:
-    last = state["messages"][-1]
-    if getattr(last, "tool_calls", None):
-        return "tools"
-    return "assistant"
-
-
-def _route_after_tools(state: AgentState) -> str:
-    for message in reversed(state["messages"]):
-        if isinstance(message, AIMessage) and message.tool_calls:
-            if any(call["name"] == "finish" for call in message.tool_calls):
-                return END
-            return "assistant"
-    return "assistant"
-
-import time
-
-from langgraph.graph import END, START, StateGraph
-from langgraph.prebuilt import ToolNode
-
-# Create an analysis node that could be used for post-processing or analysis between tool use and the assistant.
-def analysis_node(state: AgentState):
-    # Here you could insert code to analyze state, e.g., logging, extractions, side effects, etc.
-    print("Analysis node: reviewing/interpreting intermediate state before handing back to assistant.")
-    # For demonstration, just return state unmodified.
-    return state
-
-# Graph
-builder = StateGraph(AgentState)
-
-# Define nodes: these do the work
-builder.add_node("assistant", assistant)
-builder.add_node("tools", ToolNode(tools, handle_tool_errors=True))
-
-# Define edges: these determine how the control flow moves
-builder.add_edge(START, "assistant")
-builder.add_conditional_edges(
-    "assistant",
-    _route_after_assistant,
-    {"tools": "tools", "assistant": "assistant"},
-)
-builder.add_conditional_edges(
-    "tools",
-    _route_after_tools,
-    {"assistant": "assistant", END: END},
-)
-builder.set_entry_point("assistant")
-
-react_graph = builder.compile()
-
-graph_png = Path(__file__).resolve().parent / "react_graph.png"
-react_graph.get_graph().draw_mermaid_png(output_file_path=str(graph_png))
-print(graph_png)
-
-
+def _write_graph_png(graph) -> None:
+    graph_png = Path(__file__).resolve().parent / "react_graph.png"
+    graph.get_graph().draw_mermaid_png(output_file_path=str(graph_png))
+    print(graph_png)
 
 
 def _langfuse_handler():
@@ -412,68 +454,45 @@ def _langfuse_handler():
 
 class Agent:
     def __init__(self):
-        self.graph = builder.compile()
-    
+        self.graph = build_graph()
+
     def invoke(self, input_message):
         log_file, log_path = _open_trace_log()
         print(f"trace written to {log_path.relative_to(Path(__file__).resolve().parent)}")
         try:
             handler = _langfuse_handler()
-            payload = {"messages": [HumanMessage(content=input_message)]}
+            payload = {
+                "messages": [HumanMessage(content=input_message)],
+                "loop_count": 0,
+            }
             config = {"recursion_limit": 80}
             if handler is not None:
                 config["callbacks"] = [handler]
                 config["run_name"] = "dag-agent"
             if handler is None:
-                result = self.graph.invoke(payload, config=config)
+                trace = nullcontext()
             else:
                 from langfuse import get_client, propagate_attributes
 
-                with propagate_attributes(trace_name="dag-explorer", tags=["langgraph"]):
-                    result = self.graph.invoke(payload, config=config)
+                trace = propagate_attributes(trace_name="dag-explorer", tags=["langgraph"])
+            with trace:
+                result = self.graph.invoke(payload, config=config)
+            if handler is not None:
                 get_client().flush()
             for m in result.get("messages", []):
                 _print_message(m, log_file)
             last_msg = result["messages"][-1]
-            # Extract the answer after '>anwser>' if present in last_msg.content
-            content_str = str(last_msg.content) if hasattr(last_msg, "content") else str(last_msg)
-            if "<answer>" in content_str:
-                content_str = content_str.split("<answer>", 1)[1].split("</answer>", 1)[0].strip()
-            print(content_str, file=log_file)
-            return content_str
+            if hasattr(last_msg, "content"):
+                return str(last_msg.content)
+            return str(last_msg)
         finally:
             log_file.close()
 
     def __call__(self, input_message):
         return self.invoke(input_message)
 
-   
 
 if __name__ == "__main__":
     agent = Agent()
+    _write_graph_png(agent.graph)
     print(agent.invoke("Start the exploration."))
-
-    # print("nodes:", [(node.index, node.name) for node in dag.nodes])
-    # print("\n")
-    # print("true edges:", dag.edges)
-    # print("\n")
-    # src_i, dst_i = dag.edges[0]
-    # src, dst = dag.nodes[src_i].name, dag.nodes[dst_i].name
-    # root = dag.nodes[0].name
-    # print("\n"  )
-    # print(show_status())
-    # print("\n")
-    # print(draw_edge(src, dst))
-    # print("\n")
-    # print(draw_edge(src, src))
-    # print("\n")
-    # print(freeze_node(root, 1.5))
-    # print("\n")
-    # print(show_status())
-    # print("\n")
-    # print(unfreeze_node(root))
-    # print("\n")
-    # print(freeze_node("missing", 1.0))
-    # print("\n")
-    # print(show_status())
-    

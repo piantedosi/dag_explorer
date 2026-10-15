@@ -11,7 +11,8 @@ import pygame
 
 from dag import Dag, edge_report
 
-NODE_COUNT = 6
+NODE_COUNT = 2
+MAX_NODES = 26
 WIDTH = 640
 HEIGHT = 360
 
@@ -276,15 +277,19 @@ def reveal_rect() -> pygame.Rect:
 
 
 def easy_rect() -> pygame.Rect:
-    return pygame.Rect(WIDTH - 162, 4, 70, BAR_H - 8)
+    return pygame.Rect(WIDTH - 176, 4, 84, BAR_H - 8)
 
 
 def setup_easy_rect() -> pygame.Rect:
     return pygame.Rect(WIDTH // 2 - 58, 256, 116, 28)
 
 
-def play_again_rect() -> pygame.Rect:
-    return pygame.Rect(8, 4, 104, BAR_H - 8)
+def restart_rect() -> pygame.Rect:
+    return pygame.Rect(8, 4, 76, BAR_H - 8)
+
+
+def next_rect() -> pygame.Rect:
+    return pygame.Rect(90, 4, 52, BAR_H - 8)
 
 
 def setup_minus_rect() -> pygame.Rect:
@@ -309,8 +314,12 @@ def on_mouse_down(game: Game, event: pygame.event.Event, rng: random.Random) -> 
         return
     if event.button != 1:
         return
-    if (game.won or game.revealed) and play_again_rect().collidepoint(event.pos):
-        game.armed = "again"
+    if restart_rect().collidepoint(event.pos):
+        game.armed = "restart"
+        game.drag_from = None
+        return
+    if game.won and next_rect().collidepoint(event.pos):
+        game.armed = "next"
         game.drag_from = None
         return
     if easy_rect().collidepoint(event.pos):
@@ -335,8 +344,10 @@ def on_mouse_up(game: Game, event: pygame.event.Event, rng: random.Random) -> st
         return
     armed = game.armed
     game.armed = None
-    if armed == "again" and play_again_rect().collidepoint(event.pos):
+    if armed == "restart" and restart_rect().collidepoint(event.pos):
         return "setup"
+    if armed == "next" and game.won and next_rect().collidepoint(event.pos):
+        return "next"
     if armed == "easy" and easy_rect().collidepoint(event.pos):
         game.easy = not game.easy
         game.drag_from = None
@@ -485,14 +496,17 @@ def draw_setup(
 def draw(surface: pygame.Surface, game: Game, font: pygame.font.Font, small: pygame.font.Font) -> None:
     surface.fill(BG)
     pygame.draw.rect(surface, BAR, (0, 0, WIDTH, BAR_H))
-    if game.won or game.revealed:
-        draw_button(surface, play_again_rect(), "New game", small, game.armed == "again")
-    else:
-        missing, wrong = game.dag.edge_counts()
-        hint = small.render(edge_report(missing, wrong), True, MUTED)
-        surface.blit(hint, (8, (BAR_H - hint.get_height()) // 2))
+    draw_button(surface, restart_rect(), "Restart", small, game.armed == "restart")
+    if game.won:
+        draw_button(surface, next_rect(), "Next", small, game.armed == "next")
+    elif not game.revealed:
+        if game.easy:
+            missing, wrong = game.dag.edge_counts()
+            hint = small.render(edge_report(missing, wrong), True, MUTED)
+            hint_x = restart_rect().right + 8
+            surface.blit(hint, (hint_x, (BAR_H - hint.get_height()) // 2))
         draw_button(surface, reveal_rect(), "Reveal", small, game.armed == "reveal")
-    draw_button(surface, easy_rect(), "Easy", small, game.easy or game.armed == "easy")
+    draw_button(surface, easy_rect(), "Easy: on" if game.easy else "Easy: off", small, game.easy or game.armed == "easy")
 
     show_solution = game.won or game.revealed
     true_edges = set(game.dag.edges)
@@ -581,11 +595,13 @@ async def main() -> None:
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 on_mouse_down(game, event, rng)
             elif event.type == pygame.MOUSEBUTTONUP:
-                if on_mouse_up(game, event, rng) == "setup":
-                    node_count = len(game.dag.nodes)
-                    easy = game.easy
+                action = on_mouse_up(game, event, rng)
+                if action == "setup":
                     game = None
                     armed = None
+                elif action == "next":
+                    count = min(MAX_NODES, len(game.dag.nodes) + 1)
+                    game = make_game(rng, count, game.easy)
             elif event.type == pygame.MOUSEMOTION:
                 on_motion(game, event)
             elif event.type == pygame.KEYDOWN:
@@ -612,7 +628,7 @@ def handle_setup(
         if event.key in (pygame.K_LEFT, pygame.K_DOWN):
             node_count = max(2, node_count - 1)
         elif event.key in (pygame.K_RIGHT, pygame.K_UP):
-            node_count = min(26, node_count + 1)
+            node_count = min(MAX_NODES, node_count + 1)
         elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             game = make_game(rng, node_count, easy)
         return node_count, armed, game, easy
@@ -633,7 +649,7 @@ def handle_setup(
         if choice == "minus" and setup_minus_rect().collidepoint(event.pos):
             node_count = max(2, node_count - 1)
         elif choice == "plus" and setup_plus_rect().collidepoint(event.pos):
-            node_count = min(26, node_count + 1)
+            node_count = min(MAX_NODES, node_count + 1)
         elif choice == "setup-easy" and setup_easy_rect().collidepoint(event.pos):
             easy = not easy
         elif choice == "start" and setup_start_rect().collidepoint(event.pos):

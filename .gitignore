@@ -17,8 +17,6 @@ htmlcov/
 build/
 dist/
 
-# Run traces
-logs/
 
 # Local tooling
 .idea/
