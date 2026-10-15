@@ -1,0 +1,27 @@
+# Secrets
+.env
+langfuse/.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Packaging
+build/
+dist/
+
+# Run traces
+logs/
+
+# Local tooling
+.idea/
+.vscode/
+*.swp
+.DS_Store

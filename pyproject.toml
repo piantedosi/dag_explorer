@@ -1,0 +1,20 @@
+[project]
+name = "dag-explorer"
+version = "0.1.0"
+description = "Discover the arrows of a hidden causal DAG"
+requires-python = ">=3.11"
+dependencies = [
+    "langfuse>=3",
+    "langchain-core>=1.6.10",
+    "langchain-huggingface>=1.2.3",
+    "langchain-openai>=1.7.1",
+    "langgraph>=1.2.15",
+    "pygame>=2.6",
+    "requests>=2.34.2",
+    "vllm>=0.31.0",
+    "graphviz>=0.21",
+    "grandalf>=0.8",
+]
+
+[tool.uv]
+package = false
